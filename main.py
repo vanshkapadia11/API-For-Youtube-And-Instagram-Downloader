@@ -215,14 +215,7 @@ def youtube_info():
         if "age" in msg.lower():
             return jsonify({"error": "Age-restricted video."}), 403
         if "not available" in msg.lower():
-            return (
-                jsonify(
-                    {
-                        "error": "Video not available in this region. Try setting YTDLP_PROXY env var."
-                    }
-                ),
-                404,
-            )
+            return jsonify({"error": f"Region error — full msg: {msg[:500]}"}), 404
         return jsonify({"error": f"yt-dlp error: {msg[:300]}"}), 500
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
