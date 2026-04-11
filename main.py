@@ -152,9 +152,13 @@ def youtube_info():
         for f in info.get("formats") or []:
             if not f.get("url"):
                 continue
-            if f.get("vcodec") == "none" or f.get("acodec") == "none":
+            # Must have both video and audio
+            if f.get("vcodec") in (None, "none"):
                 continue
-            if f.get("ext") != "mp4":
+            if f.get("acodec") in (None, "none"):
+                continue
+            # Accept mp4 and webm
+            if f.get("ext") not in ("mp4", "webm"):
                 continue
 
             quality = f.get("format_note") or ""
@@ -167,14 +171,15 @@ def youtube_info():
 
             filesize = f.get("filesize") or f.get("filesize_approx") or 0
             size_str = f"{filesize / (1024*1024):.1f} MB" if filesize else ""
+            ext = f.get("ext", "mp4")
 
             formats.append(
                 {
                     "quality": quality,
                     "url": f["url"],
-                    "label": f"{quality} MP4",
+                    "label": f"{quality} {ext.upper()}",
                     "size": size_str,
-                    "ext": "mp4",
+                    "ext": ext,
                 }
             )
 
