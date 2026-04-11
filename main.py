@@ -3,7 +3,18 @@ import yt_dlp
 import tempfile
 import subprocess
 import instaloader
+import requests as req_lib
 from flask import Flask, request, jsonify, send_file
+
+# ── ffmpeg path setup (works on Render without root) ──────────────────────────
+try:
+    import imageio_ffmpeg
+
+    _ffmpeg_dir = os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+    os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+    print(f"[ffmpeg] ✅ Using bundled ffmpeg from: {_ffmpeg_dir}")
+except Exception as _e:
+    print(f"[ffmpeg] ⚠️ imageio_ffmpeg not found, using system ffmpeg: {_e}")
 
 app = Flask(__name__)
 
@@ -99,18 +110,29 @@ def health():
             )
         )
     )
+
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        ffmpeg_status = "✅ available"
+    except Exception:
+        ffmpeg_status = "❌ not found"
+
     return jsonify(
         {
             "status": "ok",
             "service": "VidiFlow Media API",
             "endpoints": {
                 "youtube_info": "POST /youtube/info",
-                "youtube_video": "POST /youtube/video  → streams MP4 file",
-                "youtube_audio": "POST /youtube/audio  → streams MP3 file",
+                "youtube_video": "POST /youtube/video   → streams MP4",
+                "youtube_audio": "POST /youtube/audio   → streams MP3",
+                "youtube_shorts": "POST /youtube/shorts  → streams MP4",
                 "instagram_info": "POST /instagram/info",
+                "instagram_video": "POST /instagram/video → streams MP4 (reels)",
+                "instagram_image": "POST /instagram/image → streams JPG (posts)",
             },
             "youtube_cookies": "✅ loaded" if has_yt_cookies else "❌ missing",
             "instagram_cookies": "✅ loaded" if has_ig_cookies else "❌ missing",
+            "ffmpeg": ffmpeg_status,
             "geo_bypass": "✅ enabled (US)",
             "proxy": "✅ configured" if os.environ.get("YTDLP_PROXY") else "➖ not set",
         }
@@ -198,8 +220,75 @@ def build_video_formats(info):
 
 
 def sanitize_filename(name):
-    """Strip characters unsafe for filenames."""
-    return "".join(c for c in name if c.isalnum() or c in " _-").strip() or "video"
+    return "".join(c for c in name if c.isalnum() or c in " _-").strip() or "media"
+
+
+def download_mp4(url, quality="720p", prefix="vidiflow_video_"):
+    """
+    Shared helper: downloads + merges video to MP4.
+    Returns (mp4_filepath, safe_title, tmp_dir).
+    Caller must cleanup tmp_dir.
+    """
+    height_map = {
+        "1080p": 1080,
+        "720p": 720,
+        "480p": 480,
+        "360p": 360,
+        "240p": 240,
+        "144p": 144,
+    }
+    max_height = height_map.get(quality, 720)
+
+    tmp_dir = tempfile.mkdtemp(prefix=prefix)
+    output_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
+
+    fmt = (
+        f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]"
+        f"/bestvideo[height<={max_height}]+bestaudio"
+        f"/best[height<={max_height}]"
+        f"/best"
+    )
+
+    ydl_opts = {
+        **get_ydl_opts("youtube"),
+        "skip_download": False,
+        "format": fmt,
+        "outtmpl": output_template,
+        "merge_output_format": "mp4",
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    title = info.get("title", "video")
+    safe_title = sanitize_filename(title)
+
+    mp4_file = None
+    for fname in os.listdir(tmp_dir):
+        if fname.endswith(".mp4"):
+            mp4_file = os.path.join(tmp_dir, fname)
+            break
+    if not mp4_file:
+        for fname in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, fname)
+            if os.path.isfile(fpath):
+                mp4_file = fpath
+                break
+
+    return mp4_file, safe_title, tmp_dir
+
+
+def cleanup_dir(tmp_dir):
+    import threading, shutil
+
+    def _rm():
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_rm, daemon=True).start()
 
 
 # ── YOUTUBE: /youtube/info ────────────────────────────────────────────────────
@@ -270,18 +359,11 @@ def youtube_info():
         return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
 
 
-# ── YOUTUBE: /youtube/audio  → returns MP3 file ───────────────────────────────
+# ── YOUTUBE: /youtube/audio  → MP3 ───────────────────────────────────────────
 
 
 @app.route("/youtube/audio", methods=["POST"])
 def youtube_audio():
-    """
-    Downloads the best audio stream, converts to MP3 via ffmpeg,
-    and streams the MP3 file back to the client.
-
-    Body: { "url": "https://youtube.com/watch?v=..." }
-    Response: audio/mpeg file attachment
-    """
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -294,10 +376,9 @@ def youtube_audio():
     output_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
 
     try:
-        # yt-dlp downloads best audio and post-processes to MP3 via ffmpeg
         ydl_opts = {
             **get_ydl_opts("youtube"),
-            "skip_download": False,  # we DO want to download
+            "skip_download": False,
             "format": "bestaudio/best",
             "outtmpl": output_template,
             "postprocessors": [
@@ -312,10 +393,8 @@ def youtube_audio():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        title = info.get("title", "audio")
-        safe_title = sanitize_filename(title)
+        safe_title = sanitize_filename(info.get("title", "audio"))
 
-        # Find the produced .mp3 file in the temp dir
         mp3_file = None
         for fname in os.listdir(tmp_dir):
             if fname.endswith(".mp3"):
@@ -330,7 +409,7 @@ def youtube_audio():
                 500,
             )
 
-        print(f"[Audio] ✅ MP3 ready: {mp3_file} ({os.path.getsize(mp3_file)} bytes)")
+        print(f"[Audio] ✅ {mp3_file} ({os.path.getsize(mp3_file)} bytes)")
 
         return send_file(
             mp3_file,
@@ -352,31 +431,14 @@ def youtube_audio():
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
     finally:
-        # Cleanup temp dir in background after response (best-effort)
-        import threading
-        import shutil
-
-        def _cleanup():
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
-
-        threading.Thread(target=_cleanup, daemon=True).start()
+        cleanup_dir(tmp_dir)
 
 
-# ── YOUTUBE: /youtube/video  → returns MP4 file ───────────────────────────────
+# ── YOUTUBE: /youtube/video  → MP4 ───────────────────────────────────────────
 
 
 @app.route("/youtube/video", methods=["POST"])
 def youtube_video():
-    """
-    Downloads best video+audio for the requested quality, muxes to MP4
-    via ffmpeg, and streams the MP4 file back to the client.
-
-    Body: { "url": "...", "quality": "720p" }  (quality optional, default 720p)
-    Response: video/mp4 file attachment
-    """
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
 
@@ -386,65 +448,11 @@ def youtube_video():
     if not url:
         return jsonify({"error": "URL is required"}), 400
 
-    # Map quality label to max height for yt-dlp format selector
-    height_map = {
-        "1080p": 1080,
-        "720p": 720,
-        "480p": 480,
-        "360p": 360,
-        "240p": 240,
-        "144p": 144,
-    }
-    max_height = height_map.get(quality, 720)
-
-    tmp_dir = tempfile.mkdtemp(prefix="vidiflow_video_")
-    output_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
-
+    tmp_dir = None
     try:
-        # Format selector:
-        #   - best mp4 up to max_height with audio, or
-        #   - best video-only up to max_height + best audio, merged to mp4
-        fmt = (
-            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={max_height}]+bestaudio"
-            f"/best[height<={max_height}]"
-            f"/best"
+        mp4_file, safe_title, tmp_dir = download_mp4(
+            url, quality, prefix="vidiflow_video_"
         )
-
-        ydl_opts = {
-            **get_ydl_opts("youtube"),
-            "skip_download": False,
-            "format": fmt,
-            "outtmpl": output_template,
-            "merge_output_format": "mp4",  # ffmpeg merges to MP4
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                }
-            ],
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-        title = info.get("title", "video")
-        safe_title = sanitize_filename(title)
-
-        # Find the produced .mp4 file
-        mp4_file = None
-        for fname in os.listdir(tmp_dir):
-            if fname.endswith(".mp4"):
-                mp4_file = os.path.join(tmp_dir, fname)
-                break
-
-        # Fallback: any video file
-        if not mp4_file:
-            for fname in os.listdir(tmp_dir):
-                fpath = os.path.join(tmp_dir, fname)
-                if os.path.isfile(fpath):
-                    mp4_file = fpath
-                    break
 
         if not mp4_file or not os.path.exists(mp4_file):
             return (
@@ -456,9 +464,7 @@ def youtube_video():
                 500,
             )
 
-        print(
-            f"[Video] ✅ MP4 ready: {mp4_file} ({os.path.getsize(mp4_file)/1024/1024:.1f} MB)"
-        )
+        print(f"[Video] ✅ {mp4_file} ({os.path.getsize(mp4_file)/1024/1024:.1f} MB)")
 
         return send_file(
             mp4_file,
@@ -493,19 +499,84 @@ def youtube_video():
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
     finally:
-        import threading
-        import shutil
+        if tmp_dir:
+            cleanup_dir(tmp_dir)
 
-        def _cleanup():
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
 
-        threading.Thread(target=_cleanup, daemon=True).start()
+# ── YOUTUBE: /youtube/shorts  → MP4 ──────────────────────────────────────────
+# Shorts are just normal YouTube videos with a /shorts/ URL.
+# yt-dlp handles them identically — this endpoint normalizes the URL
+# and forwards to the same download logic.
+
+
+@app.route("/youtube/shorts", methods=["POST"])
+def youtube_shorts():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    url = data.get("url", "").strip()
+    quality = data.get("quality", "720p").strip()
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+
+    # Normalize shorts URL → standard watch URL so yt-dlp is happy
+    if "/shorts/" in url:
+        video_id = url.split("/shorts/")[-1].split("?")[0]
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        print(f"[Shorts] Normalized URL → {url}")
+
+    tmp_dir = None
+    try:
+        mp4_file, safe_title, tmp_dir = download_mp4(
+            url, quality, prefix="vidiflow_shorts_"
+        )
+
+        if not mp4_file or not os.path.exists(mp4_file):
+            return (
+                jsonify(
+                    {
+                        "error": "Shorts MP4 download failed — ffmpeg may not be installed."
+                    }
+                ),
+                500,
+            )
+
+        print(f"[Shorts] ✅ {mp4_file} ({os.path.getsize(mp4_file)/1024/1024:.1f} MB)")
+
+        return send_file(
+            mp4_file,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"{safe_title}_short.mp4",
+        )
+
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        if "Sign in" in msg or "bot" in msg.lower() or "cookies" in msg.lower():
+            return (
+                jsonify(
+                    {
+                        "error": "YouTube bot check failed. Add YOUTUBE_COOKIES env var on Render."
+                    }
+                ),
+                403,
+            )
+        if "Private video" in msg:
+            return jsonify({"error": "This video is private."}), 403
+        if "age" in msg.lower():
+            return jsonify({"error": "Age-restricted video."}), 403
+        return jsonify({"error": f"yt-dlp error: {msg[:300]}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
+    finally:
+        if tmp_dir:
+            cleanup_dir(tmp_dir)
 
 
 # ── INSTAGRAM: /instagram/info ────────────────────────────────────────────────
+# Returns metadata + format list. Does NOT download.
+# Use /instagram/video or /instagram/image to actually download.
 
 
 @app.route("/instagram/info", methods=["POST"])
@@ -519,59 +590,64 @@ def instagram_info():
         return jsonify({"error": "URL is required"}), 400
 
     try:
-        print(f"[Instagram] Trying yt-dlp for: {url}")
-        opts = get_ydl_opts("instagram")
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        print(f"[Instagram] Fetching info: {url}")
+        with yt_dlp.YoutubeDL(get_ydl_opts("instagram")) as ydl:
             info = ydl.extract_info(url, download=False)
 
         if not info:
             return jsonify({"error": "Could not extract Instagram info"}), 404
 
         thumbnail = info.get("thumbnail", "")
+
+        # Detect media type
+        # If there are video formats → it's a reel/video post
+        # If only thumbnail/image → it's a photo post
+        has_video = any(
+            (f.get("vcodec") or "none") != "none"
+            for f in (info.get("formats") or [])
+            if f.get("url")
+        )
+
+        media_type = "video" if has_video else "image"
+
         formats = []
-        for f in info.get("formats") or []:
-            if f.get("url") and (f.get("vcodec") or "none") != "none":
-                height = f.get("height") or 0
-                formats.append(
-                    {
-                        "quality": f"{height}p" if height else "HD",
-                        "url": f["url"],
-                        "label": f"{height}p" if height else "HD",
-                        "height": height,
-                    }
-                )
+        if has_video:
+            for f in info.get("formats") or []:
+                if f.get("url") and (f.get("vcodec") or "none") != "none":
+                    height = f.get("height") or 0
+                    formats.append(
+                        {
+                            "quality": f"{height}p" if height else "HD",
+                            "url": f["url"],
+                            "label": f"{height}p" if height else "HD",
+                            "height": height,
+                        }
+                    )
+            formats.sort(key=lambda x: x.get("height", 0), reverse=True)
+            if not formats and info.get("url"):
+                formats = [{"quality": "HD", "url": info["url"], "label": "HD"}]
 
-        formats.sort(key=lambda x: x.get("height", 0), reverse=True)
-
-        if not formats and info.get("url"):
-            formats = [{"quality": "HD", "url": info["url"], "label": "HD"}]
-
-        if not formats:
-            return jsonify({"error": "No video found in this Instagram post"}), 404
-
-        print(f"[Instagram] ✅ yt-dlp success, formats: {len(formats)}")
+        print(f"[Instagram] ✅ type={media_type}, formats={len(formats)}")
 
         return jsonify(
             {
                 "success": True,
-                "type": "video",
+                "type": media_type,  # "video" or "image"
                 "url": url,
                 "title": info.get("title", "")
                 or info.get("description", "")
-                or "Instagram Video",
+                or "Instagram Post",
                 "author": info.get("uploader", "") or info.get("channel", ""),
                 "thumbnail": thumbnail,
                 "duration": info.get("duration", 0),
                 "formats": formats,
-                "defaultUrl": formats[0]["url"],
+                "defaultUrl": formats[0]["url"] if formats else thumbnail,
             }
         )
 
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         print(f"[Instagram] yt-dlp failed: {msg[:200]}")
-
         if "login" in msg.lower() or "private" in msg.lower():
             return (
                 jsonify(
@@ -588,71 +664,188 @@ def instagram_info():
                 ),
                 404,
             )
+        return jsonify({"error": f"Could not extract Instagram info: {msg[:200]}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
 
-        # Retry without cookies, mobile UA
-        try:
-            print("[Instagram] Retrying without cookies...")
-            basic_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "geo_bypass": True,
-                "geo_bypass_country": "US",
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-                },
-            }
-            proxy = os.environ.get("YTDLP_PROXY", "")
-            if proxy:
-                basic_opts["proxy"] = proxy
 
-            with yt_dlp.YoutubeDL(basic_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+# ── INSTAGRAM: /instagram/video  → MP4 (reels/videos) ────────────────────────
 
-            if info and (info.get("url") or info.get("formats")):
-                formats = []
-                for f in info.get("formats") or []:
-                    if f.get("url") and (f.get("vcodec") or "none") != "none":
-                        height = f.get("height") or 0
-                        formats.append(
-                            {
-                                "quality": f"{height}p" if height else "HD",
-                                "url": f["url"],
-                                "label": f"{height}p" if height else "HD",
-                                "height": height,
-                            }
-                        )
 
-                formats.sort(key=lambda x: x.get("height", 0), reverse=True)
+@app.route("/instagram/video", methods=["POST"])
+def instagram_video():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
 
-                if not formats and info.get("url"):
-                    formats = [{"quality": "HD", "url": info["url"], "label": "HD"}]
+    data = request.get_json()
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
 
-                if formats:
-                    print("[Instagram] ✅ Retry success")
-                    return jsonify(
-                        {
-                            "success": True,
-                            "type": "video",
-                            "url": url,
-                            "title": info.get("title", "") or "Instagram Video",
-                            "author": info.get("uploader", ""),
-                            "thumbnail": info.get("thumbnail", ""),
-                            "duration": info.get("duration", 0),
-                            "formats": formats,
-                            "defaultUrl": formats[0]["url"],
-                        }
-                    )
-        except Exception as retry_e:
-            print(f"[Instagram] Retry failed: {retry_e}")
+    tmp_dir = tempfile.mkdtemp(prefix="vidiflow_ig_video_")
+    output_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
 
-        return (
-            jsonify({"error": f"Could not extract Instagram video: {msg[:200]}"}),
-            500,
+    try:
+        ydl_opts = {
+            **get_ydl_opts("instagram"),
+            "skip_download": False,
+            "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+            "outtmpl": output_template,
+            "merge_output_format": "mp4",
+            "postprocessors": [
+                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
+            ],
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        safe_title = sanitize_filename(
+            info.get("title", "") or info.get("description", "") or "reel"
+        )
+
+        mp4_file = None
+        for fname in os.listdir(tmp_dir):
+            if fname.endswith(".mp4"):
+                mp4_file = os.path.join(tmp_dir, fname)
+                break
+        if not mp4_file:
+            for fname in os.listdir(tmp_dir):
+                fpath = os.path.join(tmp_dir, fname)
+                if os.path.isfile(fpath):
+                    mp4_file = fpath
+                    break
+
+        if not mp4_file or not os.path.exists(mp4_file):
+            return jsonify({"error": "Instagram video download failed."}), 500
+
+        print(
+            f"[IG Video] ✅ {mp4_file} ({os.path.getsize(mp4_file)/1024/1024:.1f} MB)"
+        )
+
+        return send_file(
+            mp4_file,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"{safe_title}.mp4",
+        )
+
+    except yt_dlp.utils.DownloadError as e:
+        msg = str(e)
+        if "login" in msg.lower() or "private" in msg.lower():
+            return (
+                jsonify(
+                    {"error": "This Instagram account is private or requires login."}
+                ),
+                403,
+            )
+        if "not found" in msg.lower():
+            return (
+                jsonify(
+                    {
+                        "error": "Instagram post not found. Make sure the account is public."
+                    }
+                ),
+                404,
+            )
+        return jsonify({"error": f"yt-dlp error: {msg[:300]}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
+    finally:
+        cleanup_dir(tmp_dir)
+
+
+# ── INSTAGRAM: /instagram/image  → JPG (photo posts) ─────────────────────────
+
+
+@app.route("/instagram/image", methods=["POST"])
+def instagram_image():
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+
+    tmp_dir = tempfile.mkdtemp(prefix="vidiflow_ig_image_")
+
+    try:
+        # First extract info to get the thumbnail / image URL
+        with yt_dlp.YoutubeDL(get_ydl_opts("instagram")) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            return jsonify({"error": "Could not extract Instagram post info"}), 404
+
+        # For image posts, yt-dlp exposes the image via thumbnail
+        image_url = info.get("thumbnail", "")
+
+        # If it's actually a video post, reject
+        has_video = any(
+            (f.get("vcodec") or "none") != "none"
+            for f in (info.get("formats") or [])
+            if f.get("url")
+        )
+        if has_video:
+            return (
+                jsonify(
+                    {
+                        "error": "This post contains a video, not an image. Use /instagram/video instead."
+                    }
+                ),
+                400,
+            )
+
+        if not image_url:
+            return jsonify({"error": "No image found in this Instagram post."}), 404
+
+        safe_title = sanitize_filename(
+            info.get("title", "") or info.get("description", "") or "instagram_post"
+        )
+
+        # Download the image via requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.instagram.com/",
+        }
+        img_response = req_lib.get(image_url, headers=headers, timeout=30)
+        if img_response.status_code != 200:
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to download image (HTTP {img_response.status_code})"
+                    }
+                ),
+                500,
+            )
+
+        # Detect extension from content-type
+        content_type = img_response.headers.get("Content-Type", "image/jpeg")
+        ext = "jpg"
+        if "png" in content_type:
+            ext = "png"
+        elif "webp" in content_type:
+            ext = "webp"
+
+        img_path = os.path.join(tmp_dir, f"{safe_title}.{ext}")
+        with open(img_path, "wb") as f:
+            f.write(img_response.content)
+
+        print(f"[IG Image] ✅ {img_path} ({len(img_response.content)} bytes)")
+
+        mime_map = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+        return send_file(
+            img_path,
+            mimetype=mime_map.get(ext, "image/jpeg"),
+            as_attachment=True,
+            download_name=f"{safe_title}.{ext}",
         )
 
     except Exception as e:
         return jsonify({"error": f"Server error: {str(e)[:200]}"}), 500
+    finally:
+        cleanup_dir(tmp_dir)
 
 
 # ── DEBUG: /youtube/debug ─────────────────────────────────────────────────────
