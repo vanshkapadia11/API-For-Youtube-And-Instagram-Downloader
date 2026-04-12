@@ -66,6 +66,8 @@ def write_cookies_file(platform="youtube"):
 
 
 def get_ydl_opts(platform="youtube", extra={}):
+    proxy = os.environ.get("YTDLP_PROXY", "")
+
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -73,7 +75,6 @@ def get_ydl_opts(platform="youtube", extra={}):
         "noplaylist": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
-        # ← KEY FIX: android client gives direct MP4 streams, not HLS
         "extractor_args": {
             "youtube": {
                 "player_client": ["web", "android"],
@@ -84,15 +85,27 @@ def get_ydl_opts(platform="youtube", extra={}):
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
-        **extra,
     }
-    proxy = os.environ.get("YTDLP_PROXY", "")
+
+    # extra ko baad mein merge karo
+    opts.update(extra)
+
+    # proxy HAMESHA force karo — extra se override na ho
     if proxy:
         opts["proxy"] = proxy
         print(f"[yt-dlp] Using proxy: {proxy[:30]}...")
+
+    # extractor_args bhi HAMESHA set karo — extra se override na ho
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["web", "android"],
+        }
+    }
+
     cookies_path = write_cookies_file(platform)
     if cookies_path:
         opts["cookiefile"] = cookies_path
+
     return opts
 
 
