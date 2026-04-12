@@ -37,6 +37,12 @@ def check_auth():
 def write_cookies_file(platform="youtube"):
     env_key = "YOUTUBE_COOKIES" if platform == "youtube" else "INSTAGRAM_COOKIES"
     cookies_content = os.environ.get(env_key, "")
+    # Fix Windows-style line endings
+    cookies_content = cookies_content.replace("\r\n", "\n").replace("\r", "\n")
+
+    print(f"[cookies] {env_key} length: {len(cookies_content)} chars")
+    print(f"[cookies] First 80 chars: {cookies_content[:80]!r}")
+
     local_cookies = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), f"{platform}_cookies.txt"
     )
@@ -67,6 +73,12 @@ def get_ydl_opts(platform="youtube", extra={}):
         "noplaylist": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
+        # ← KEY FIX: android client gives direct MP4 streams, not HLS
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android"],
+            }
+        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
@@ -297,7 +309,7 @@ def youtube_audio():
         ydl_opts = {
             **get_ydl_opts("youtube"),
             "skip_download": False,
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": os.path.join(tmp_dir, "%(title)s.%(ext)s"),
             "postprocessors": [
                 {
@@ -439,11 +451,6 @@ def youtube_shorts():
         url = f"https://www.youtube.com/watch?v={video_id}"
         print(f"[Shorts] Normalized → {url}")
 
-    # Reuse video endpoint logic
-    req_data = request.get_json() or {}
-    req_data["url"] = url
-    req_data["quality"] = quality
-
     tmp_dir = tempfile.mkdtemp(prefix="vidiflow_shorts_")
     try:
         height_map = {
@@ -455,7 +462,11 @@ def youtube_shorts():
             "144p": 144,
         }
         max_height = height_map.get(quality, 720)
-        fmt = f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+        fmt = (
+            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]"
+            f"/bestvideo[height<={max_height}]+bestaudio"
+            f"/best[height<={max_height}]/best"
+        )
         ydl_opts = {
             **get_ydl_opts("youtube"),
             "skip_download": False,
