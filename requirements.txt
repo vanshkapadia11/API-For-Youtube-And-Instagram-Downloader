@@ -3,4 +3,4 @@ yt-dlp==2025.3.31
 gunicorn==22.0.0
 instaloader==4.13
 requests==2.32.3
-imageio-ffmpeg
+imageio-ffmpeg==0.5.1
