@@ -98,7 +98,7 @@ def get_ydl_opts(platform="youtube", extra={}):
     # extractor_args bhi HAMESHA set karo — extra se override na ho
     opts["extractor_args"] = {
         "youtube": {
-            "player_client": ["tv_embedded"],
+            "player_client": ["ios"],
         }
     }
 
