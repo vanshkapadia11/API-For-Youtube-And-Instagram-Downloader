@@ -201,19 +201,30 @@ def build_video_formats(info):
 
 
 def yt_error_response(msg):
-    if "Sign in" in msg or "bot" in msg.lower() or "cookies" in msg.lower():
+    print(f"[yt-dlp ERROR] {msg}")  # ← yeh add karo
+    msg_lower = msg.lower()
+    # "cookies" word sirf tab trigger kare jab actual YouTube bot check fail ho
+    if "sign in" in msg or "confirm your age" in msg_lower:
         return (
             jsonify(
                 {"error": "YouTube bot check failed. Add YOUTUBE_COOKIES env var."}
             ),
             403,
         )
-    if "Private video" in msg:
+    if "bot" in msg_lower and ("detected" in msg_lower or "check" in msg_lower):
+        return (
+            jsonify(
+                {"error": "YouTube bot check failed. Add YOUTUBE_COOKIES env var."}
+            ),
+            403,
+        )
+    if "private video" in msg_lower:
         return jsonify({"error": "This video is private."}), 403
-    if "age" in msg.lower():
+    if "age" in msg_lower and "restrict" in msg_lower:
         return jsonify({"error": "Age-restricted video."}), 403
-    if "not available" in msg.lower():
+    if "not available" in msg_lower:
         return jsonify({"error": "Video not available in this region."}), 404
+    # Default — actual error dikhao debug ke liye
     return jsonify({"error": f"yt-dlp error: {msg[:300]}"}), 500
 
 
