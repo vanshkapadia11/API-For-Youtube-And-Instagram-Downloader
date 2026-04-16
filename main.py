@@ -67,7 +67,9 @@ def write_cookies_file(platform="youtube"):
 
 def get_ydl_opts(platform="youtube", extra={}):
     proxy = os.environ.get("YTDLP_PROXY", "")
-
+    if proxy:
+        os.environ["HTTP_PROXY"] = proxy
+        os.environ["HTTPS_PROXY"] = proxy
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -80,9 +82,9 @@ def get_ydl_opts(platform="youtube", extra={}):
         "js_runtimes": {"node": {}},
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "android"],
+                "player_client": ["android"],
                 # "skip": ["webpage", "configs"],
-                "skip": ["webpage", "configs"],
+                # "skip": ["webpage", "configs"],
             }
         },
         "http_headers": {
