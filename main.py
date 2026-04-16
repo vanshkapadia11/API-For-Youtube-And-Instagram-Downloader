@@ -73,7 +73,7 @@ def get_ydl_opts(platform="youtube", extra={}):
         "no_warnings": True,
         "noplaylist": True,
         "geo_bypass": True,
-        "geo_bypass_country": "US",
+        "geo_bypass_country": "IN",
         "nocheckcertificate": True,
         "retries": 3,
         # 🔥 CRITICAL FIX
