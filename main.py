@@ -67,9 +67,12 @@ def write_cookies_file(platform="youtube"):
 
 def get_ydl_opts(platform="youtube", extra={}):
     proxy = os.environ.get("YTDLP_PROXY", "")
+
+    # 🔥 FORCE proxy globally
     if proxy:
         os.environ["HTTP_PROXY"] = proxy
         os.environ["HTTPS_PROXY"] = proxy
+
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -77,16 +80,19 @@ def get_ydl_opts(platform="youtube", extra={}):
         "geo_bypass": True,
         "geo_bypass_country": "IN",
         "nocheckcertificate": True,
-        "retries": 3,
-        # 🔥 CRITICAL FIX
+        "retries": 5,
+        # 🔥 IMPORTANT
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format_sort": ["res", "ext"],
+        # 🔥 JS runtime
         "js_runtimes": {"node": {}},
+        # 🔥 ANDROID ONLY
         "extractor_args": {
             "youtube": {
                 "player_client": ["android"],
-                # "skip": ["webpage", "configs"],
-                # "skip": ["webpage", "configs"],
             }
         },
+        # 🔥 MOBILE HEADERS
         "http_headers": {
             "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
         },
