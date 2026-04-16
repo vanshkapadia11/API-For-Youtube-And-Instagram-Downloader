@@ -71,36 +71,30 @@ def get_ydl_opts(platform="youtube", extra={}):
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
         "noplaylist": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
+        "nocheckcertificate": True,
+        "retries": 3,
+        # 🔥 CRITICAL FIX
+        "js_runtimes": {"node": {}},
         "extractor_args": {
             "youtube": {
                 "player_client": ["web", "android"],
+                # "skip": ["webpage", "configs"],
+                "skip": ["webpage", "configs"],
             }
         },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
         },
     }
 
-    # extra ko baad mein merge karo
     opts.update(extra)
 
-    # proxy HAMESHA force karo — extra se override na ho
     if proxy:
         opts["proxy"] = proxy
         print(f"[yt-dlp] Using proxy: {proxy[:30]}...")
-
-    # extractor_args bhi HAMESHA set karo — extra se override na ho
-    opts["extractor_args"] = {
-        "youtube": {
-            "player_client": ["ios"],
-        }
-    }
 
     cookies_path = write_cookies_file(platform)
     if cookies_path:
@@ -132,72 +126,44 @@ def cleanup_dir(tmp_dir):
     threading.Thread(target=_rm, daemon=True).start()
 
 
-def build_video_formats(info):
-    quality_order = ["2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"]
-    formats = []
-    seen = set()
-    for f in info.get("formats") or []:
-        furl = f.get("url", "")
-        if not furl or is_hls_url(furl):
-            continue
-        if (f.get("vcodec") or "none") == "none":
-            continue
-        if (f.get("acodec") or "none") == "none":
-            continue
-        if f.get("ext") not in ("mp4", "webm"):
-            continue
-        height = f.get("height")
-        quality = f.get("format_note") or (f"{height}p" if height else None)
-        if not quality or quality in seen:
-            continue
-        seen.add(quality)
-        filesize = f.get("filesize") or f.get("filesize_approx") or 0
-        ext = f.get("ext", "mp4")
-        formats.append(
+def build_video_formats(info: dict):
+    formats = info.get("formats") or []
+
+    # 🔥 fallback if formats empty
+    if not formats and info.get("url"):
+        return [
             {
-                "quality": quality,
-                "url": furl,
-                "label": f"{quality} {ext.upper()}",
-                "size": f"{filesize/(1024*1024):.1f} MB" if filesize else "",
-                "ext": ext,
-                "is_hls": False,
+                "quality": "auto",
+                "ext": info.get("ext"),
+                "url": info.get("url"),
+            }
+        ]
+
+    out = []
+    seen = set()
+
+    for f in formats:
+        height = f.get("height")
+        url = f.get("url")
+
+        if not height or not url:
+            continue
+
+        label = f"{height}p"
+        if label in seen:
+            continue
+
+        seen.add(label)
+
+        out.append(
+            {
+                "quality": label,
+                "ext": f.get("ext"),
+                "url": url,
             }
         )
 
-    if not formats:
-        seen_hls = set()
-        for f in info.get("formats") or []:
-            furl = f.get("url", "")
-            if not furl or not is_hls_url(furl):
-                continue
-            if (f.get("vcodec") or "none") == "none":
-                continue
-            if f.get("ext") not in ("mp4", "webm"):
-                continue
-            height = f.get("height")
-            if not height:
-                continue
-            quality = f"{height}p"
-            if quality in seen_hls:
-                continue
-            seen_hls.add(quality)
-            formats.append(
-                {
-                    "quality": quality,
-                    "url": furl,
-                    "label": f"{quality} HLS",
-                    "size": "",
-                    "ext": f.get("ext", "mp4"),
-                    "is_hls": True,
-                }
-            )
-
-    formats.sort(
-        key=lambda f: (
-            quality_order.index(f["quality"]) if f["quality"] in quality_order else 99
-        )
-    )
-    return formats
+    return sorted(out, key=lambda x: int(x["quality"][:-1]), reverse=True)
 
 
 def yt_error_response(msg):
@@ -401,11 +367,8 @@ def youtube_video():
             "144p": 144,
         }
         max_height = height_map.get(quality, 720)
-        fmt = (
-            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={max_height}]+bestaudio"
-            f"/best[height<={max_height}]/best"
-        )
+        # fmt = f"bv*[height<={max_height}]+ba/" f"b[height<={max_height}]/b/best"
+        fmt = f"best[height<={max_height}]/best"
         ydl_opts = {
             **get_ydl_opts("youtube"),
             "skip_download": False,
@@ -486,11 +449,8 @@ def youtube_shorts():
             "144p": 144,
         }
         max_height = height_map.get(quality, 720)
-        fmt = (
-            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={max_height}]+bestaudio"
-            f"/best[height<={max_height}]/best"
-        )
+        # fmt = f"bv*[height<={max_height}]+ba/" f"b[height<={max_height}]/b"
+        fmt = f"best[height<={max_height}]/best"
         ydl_opts = {
             **get_ydl_opts("youtube"),
             "skip_download": False,
