@@ -81,23 +81,18 @@ def get_ydl_opts(platform="youtube", extra={}):
         "geo_bypass_country": "IN",
         "nocheckcertificate": True,
         "retries": 5,
-        # 🔥 IMPORTANT
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "format_sort": ["res", "ext"],
-        # 🔥 JS runtime
+        "format": "worstaudio/bestaudio/best",
         "js_runtimes": {"node": {}},
-        # 🔥 ANDROID ONLY
         "extractor_args": {
             "youtube": {
-                "player_client": ["android"],
+                "player_client": ["android", "tv"],
+                "player_skip": ["configs"],
             }
         },
-        # 🔥 MOBILE HEADERS
         "http_headers": {
-            "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11)",
+            "User-Agent": "com.google.android.youtube/19.09.37",
         },
     }
-
     opts.update(extra)
 
     if proxy:
