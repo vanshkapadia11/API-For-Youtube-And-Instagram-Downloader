@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 
 import requests as req_lib
 import yt_dlp
@@ -34,7 +35,6 @@ if not _node_exe:
             break
 
 if _node_exe:
-    # Ensure its directory is on PATH for subprocesses
     os.environ["PATH"] = (
         os.path.dirname(_node_exe) + os.pathsep + os.environ.get("PATH", "")
     )
@@ -45,6 +45,11 @@ else:
 app = Flask(__name__)
 API_SECRET = os.environ.get("API_SECRET", "")
 
+# ── Cookie cache — resolved once at startup, never re-read per request ─────────
+_cookie_path_cache: dict[str, str | None] = {}
+_cookie_freshness_cache: dict[str, tuple[bool, float]] = {}
+_cookie_cache_lock = threading.Lock()
+
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 def check_auth():
@@ -54,16 +59,22 @@ def check_auth():
     return token == API_SECRET
 
 
-# ── Cookie validity check ──────────────────────────────────────────────────────
+# ── Cookie validity check (cached 5 min) ──────────────────────────────────────
 def _check_cookie_freshness(cookie_path: str) -> bool:
-    """
-    Quick heuristic: parse the Netscape cookie file and check if any
-    youtube.com session cookies (SAPISID, __Secure-3PAPISID, LOGIN_INFO)
-    are present and not obviously expired (expiry > now).
-    Returns True if cookies look usable, False if stale/missing.
-    """
-    import time
+    now = time.time()
+    with _cookie_cache_lock:
+        cached = _cookie_freshness_cache.get(cookie_path)
+        if cached and (now - cached[1]) < 300:
+            return cached[0]
 
+    result = _do_check_cookie_freshness(cookie_path)
+
+    with _cookie_cache_lock:
+        _cookie_freshness_cache[cookie_path] = (result, now)
+    return result
+
+
+def _do_check_cookie_freshness(cookie_path: str) -> bool:
     if not cookie_path or not os.path.exists(cookie_path):
         return False
     session_keys = {"SAPISID", "__Secure-3PAPISID", "LOGIN_INFO", "SID", "HSID"}
@@ -100,11 +111,23 @@ def _check_cookie_freshness(cookie_path: str) -> bool:
         return True
     except Exception as e:
         print(f"[cookies] ⚠️  Could not validate cookies: {e}")
-        return True  # assume ok if we can't read
+        return True
 
 
-# ── Cookies ────────────────────────────────────────────────────────────────────
-def _get_cookie_path(platform: str):
+# ── Cookies (resolved once, cached forever per process) ───────────────────────
+def _get_cookie_path(platform: str) -> str | None:
+    with _cookie_cache_lock:
+        if platform in _cookie_path_cache:
+            return _cookie_path_cache[platform]
+
+    result = _resolve_cookie_path(platform)
+
+    with _cookie_cache_lock:
+        _cookie_path_cache[platform] = result
+    return result
+
+
+def _resolve_cookie_path(platform: str) -> str | None:
     local = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), f"{platform}_cookies.txt"
     )
@@ -148,46 +171,53 @@ def _get_cookie_path(platform: str):
 
 
 # ── yt-dlp base opts ───────────────────────────────────────────────────────────
-def _base_opts() -> dict:
-    proxy = os.environ.get("YTDLP_PROXY", "")
+# Pre-compute proxy once at module load
+_PROXY = os.environ.get("YTDLP_PROXY", "")
+if _PROXY:
+    os.environ["HTTP_PROXY"] = _PROXY
+    os.environ["HTTPS_PROXY"] = _PROXY
+    print(f"[proxy] {_PROXY[:50]}...")
+
+_BASE_OPTS_CACHE: dict[bool, dict] = {}
+
+
+def _base_opts(download: bool = False) -> dict:
+    """
+    Return base opts dict. Cached per download flag.
+    download=True  → more retries, longer timeout
+    download=False → fewer retries, shorter timeout (info-only)
+    """
+    if download in _BASE_OPTS_CACHE:
+        return dict(_BASE_OPTS_CACHE[download])  # shallow copy
+
     opts = {
         "quiet": True,
         "no_warnings": False,
         "noplaylist": True,
         "nocheckcertificate": True,
-        "retries": 5,
-        "socket_timeout": 30,
-        # ── Critical: explicitly hand yt-dlp the Node.js path so it can solve
-        #    the n-challenge (throttling param). Without this, yt-dlp finds node
-        #    via PATH but the new EJS-based solver also needs it registered here.
+        "retries": 5 if download else 2,
+        "socket_timeout": 30 if download else 10,
         "js_runtimes": {"node": {"path": _node_exe}} if _node_exe else {"node": {}},
-        # Allow fetching the EJS challenge-solver script from npm/GitHub if needed
         "remote_components": ["ejs:npm", "ejs:github"],
     }
-    if proxy:
-        opts["proxy"] = proxy
-        os.environ["HTTP_PROXY"] = proxy
-        os.environ["HTTPS_PROXY"] = proxy
-        print(f"[proxy] {proxy[:50]}...")
-    return opts
+    if _PROXY:
+        opts["proxy"] = _PROXY
+    _BASE_OPTS_CACHE[download] = opts
+    return dict(opts)
 
 
 # ── YouTube client chain ───────────────────────────────────────────────────────
 #
-#  Now that js_runtimes is explicitly set, Node.js WILL solve the n-challenge.
-#  Chain strategy:
-#   1. web_embedded — supports cookies, no PO token needed, n-challenge solved by node
-#   2. web          — standard client, cookies, n-challenge solved by node
-#   3. ios          — no cookies (by design), pre-signed URLs, no n-challenge needed
-#   4. android      — same as ios, different UA
+#  ios / android go first: pre-signed URLs, no n-challenge, fastest.
+#  web_embedded / web as fallback (cookies, n-challenge via node).
 #
 #  Each tuple: (client_name, skip_protocols, use_cookies)
 
 _YT_CLIENT_CHAIN = [
-    ("web_embedded", [], True),
-    ("web", [], True),
-    ("ios", [], False),  # no cookies — pre-signed stream URLs
-    ("android", [], False),  # no cookies — pre-signed stream URLs
+    ("ios", [], False),  # fastest — pre-signed stream URLs, no JS needed
+    ("android", [], False),  # fast fallback
+    ("web_embedded", [], True),  # cookie-backed, node n-challenge
+    ("web", [], True),  # slowest last
 ]
 
 _UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -198,9 +228,13 @@ _UA_ANDROID = (
 
 
 def _yt_opts_for_client(
-    client: str, skip_protos: list, use_cookies: bool, extra: dict = {}
+    client: str,
+    skip_protos: list,
+    use_cookies: bool,
+    extra: dict = {},
+    download: bool = False,
 ) -> dict:
-    opts = _base_opts()
+    opts = _base_opts(download)
     extractor_args: dict = {"player_client": [client]}
     if skip_protos:
         extractor_args["skip"] = skip_protos
@@ -233,23 +267,21 @@ def _extract_yt(url: str, extra: dict = {}, download: bool = False):
     """
     Try each client in the fallback chain.
     Returns (info, client_used) or raises the last exception.
+    Stale-cookie warning is emitted only once per process (not per request).
     """
-    cp = _get_cookie_path("youtube")
-    if cp and not _check_cookie_freshness(cp):
-        print(
-            "[cookies] ❌ Stale cookies detected — bot-check likely. Re-export cookies!"
-        )
+    _warn_stale_cookies_once()
 
     last_exc = None
     for client, skip_protos, use_cookies in _YT_CLIENT_CHAIN:
         try:
             print(f"[yt-dlp] Trying client: {client}")
-            opts = _yt_opts_for_client(client, skip_protos, use_cookies, extra)
+            opts = _yt_opts_for_client(
+                client, skip_protos, use_cookies, extra, download
+            )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
             if not info:
                 continue
-            # Reject stubs-only / image-only responses
             fmts = info.get("formats") or []
             has_real = any(
                 f.get("url") and f.get("vcodec", "none") != "none" for f in fmts
@@ -276,9 +308,27 @@ def _extract_yt(url: str, extra: dict = {}, download: bool = False):
     raise last_exc or yt_dlp.utils.DownloadError("All clients failed")
 
 
+# Emit the stale-cookie warning at most once per process lifetime
+_stale_warned = False
+_stale_warned_lock = threading.Lock()
+
+
+def _warn_stale_cookies_once():
+    global _stale_warned
+    with _stale_warned_lock:
+        if _stale_warned:
+            return
+        cp = _get_cookie_path("youtube")
+        if cp and not _check_cookie_freshness(cp):
+            print(
+                "[cookies] ❌ Stale cookies detected — bot-check likely. Re-export cookies!"
+            )
+        _stale_warned = True
+
+
 # ── Instagram opts ─────────────────────────────────────────────────────────────
 def _ig_opts(extra: dict = {}) -> dict:
-    opts = _base_opts()
+    opts = _base_opts(download=bool(extra))
     opts.update(
         {
             "http_headers": {
@@ -407,7 +457,7 @@ def health():
                 if os.path.exists(os.path.join(base, "instagram_cookies.txt"))
                 else ("✅ env" if os.environ.get("INSTAGRAM_COOKIES") else "❌ missing")
             ),
-            "proxy": "✅" if os.environ.get("YTDLP_PROXY") else "➖",
+            "proxy": "✅" if _PROXY else "➖",
             "endpoints": {
                 "youtube_info": "POST /youtube/info",
                 "youtube_audio": "POST /youtube/audio",
@@ -781,4 +831,7 @@ def youtube_debug():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Use threaded=True so concurrent requests don't queue behind each other.
+    # For production, swap this for gunicorn:
+    #   gunicorn -w 4 -k gevent --bind 0.0.0.0:5000 app:app
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
