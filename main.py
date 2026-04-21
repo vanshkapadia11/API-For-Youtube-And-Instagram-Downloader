@@ -216,7 +216,7 @@ def _base_opts(download: bool = False) -> dict:
 _YT_CLIENT_CHAIN = [
     ("ios", [], False),  # fastest — pre-signed stream URLs, no JS needed
     ("android", [], False),  # fast fallback
-    ("web_embedded", [], True),  # cookie-backed, node n-challenge
+    ("web_embedded", [], False),  # cookie-backed, node n-challenge
     ("web", [], True),  # slowest last
 ]
 
